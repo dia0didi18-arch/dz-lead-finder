@@ -241,7 +241,6 @@ async def scrape_google_maps(
     stats: Optional[Dict] = None,
     wilaya: Optional[str] = None,
 ) -> List[Dict]:
-    # ضمان وجود Chromium مسبقاً قبل فتح المتصفح
     _ensure_chromium_installed()
 
     known = known or KnownLeads(enabled=False)
@@ -258,7 +257,14 @@ async def scrape_google_maps(
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
                 headless=headless,
-                args=["--disable-blink-features=AutomationControlled", "--lang=fr-FR"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                    "--lang=fr-FR",
+                ],
             )
             context = await browser.new_context(
                 locale="fr-FR", viewport={"width": 1366, "height": 900}
