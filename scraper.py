@@ -20,6 +20,7 @@ pitch then targets explicitly.
 import asyncio
 import random
 import re
+import subprocess
 import sys
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
@@ -40,11 +41,17 @@ class ScraperError(Exception):
     """Raised for user-facing scraping failures."""
 
 
+def _ensure_chromium_installed() -> None:
+    """Ensure Playwright Chromium browser binaries are installed on cloud hosts."""
+    try:
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+    except Exception as e:
+        print(f"[Playwright Auto-Install Warning]: {e}")
+
+
 # --------------------------------------------------------------------------
 # Wilaya boundary enforcement
 # --------------------------------------------------------------------------
-# The 58 Algerian wilayas (French names, accents matter only for display: every
-# comparison goes through utils._norm, which strips accents).
 WILAYAS = [
     "Adrar", "Chlef", "Laghouat", "Oum El Bouaghi", "Batna", "Béjaïa", "Biskra",
     "Béchar", "Blida", "Bouira", "Tamanrasset", "Tébessa", "Tlemcen", "Tiaret",
@@ -57,7 +64,6 @@ WILAYAS = [
     "Béni Abbès", "In Salah", "In Guezzam", "Touggourt", "Djanet", "El M'Ghair", "El Meniaa",
 ]
 
-# Lightweight alias map: what a user might type -> the official wilaya name.
 WILAYA_ALIASES = {
     "algiers": "Alger", "alger": "Alger", "algiers centre": "Alger",
     "oran": "Oran", "wahran": "Oran", "constantine": "Constantine",
@@ -74,7 +80,6 @@ WILAYA_ALIASES = {
 
 
 def resolve_wilaya(city: str) -> Optional[str]:
-    """Best-effort match of a free-typed city to a wilaya (alias, then prefix)."""
     norm = _norm(city)
     for key, wilaya in WILAYA_ALIASES.items():
         if _norm(key) == norm:
@@ -87,14 +92,11 @@ def resolve_wilaya(city: str) -> Optional[str]:
 
 
 def build_maps_query(keyword: str, city: str, wilaya: Optional[str] = None) -> str:
-    """Query that pins the search inside one wilaya (keeps Google's local-IP
-    redirection from widening the search to the whole country)."""
     location = f"{city}, {wilaya}" if wilaya and _norm(wilaya) not in _norm(city) else city
     return f"{keyword} {location}, Algérie"
 
 
 def _inside_wilaya(address: str, city: str, wilaya: Optional[str]) -> bool:
-    """Post-filter: the listing address must mention the requested city or wilaya."""
     norm_addr = _norm(address)
     for token in (wilaya, city):
         t = _norm(token)
@@ -128,7 +130,6 @@ async def _attr(page: Page, selector: str, attr: str) -> str:
 
 
 async def _accept_consent(page: Page) -> None:
-    """Dismiss Google's cookie/consent wall if it shows up (EU-style redirect)."""
     labels = ("Accept all", "Tout accepter", "I agree", "J'accepte", "Reject all", "Tout refuser")
     for label in labels:
         try:
@@ -150,16 +151,11 @@ async def _collect_place_urls(
     delay_range: Tuple[float, float],
     progress: Optional[ProgressCB],
 ) -> List[str]:
-    """Scroll the results list and collect up to `target` NEW place links.
-
-    Places already saved in the database are counted in stats['skipped'] and never
-    opened, so they cost no page load, no delay and no AI quota.
-    """
     feed = page.locator('div[role="feed"]')
     try:
         await feed.wait_for(timeout=20000)
     except PWTimeout:
-        if "/maps/place/" in page.url:  # Google jumped straight to a single place
+        if "/maps/place/" in page.url:
             if known.seen_candidate(page.url, city):
                 stats["skipped"] += 1
                 return []
@@ -170,7 +166,7 @@ async def _collect_place_urls(
         )
 
     candidates: Dict[str, None] = {}
-    seen_all = set()  # place ids seen so far, new or skipped
+    seen_all = set()
     stagnant = 0
     while len(candidates) < target and stagnant < 4:
         hrefs = await page.eval_on_selector_all("a.hfpxzc", "els => els.map(e => e.href)")
@@ -216,7 +212,7 @@ async def _extract_place(page: Page, url: str) -> Dict:
     website = await _attr(page, 'a[data-item-id="authority"]', "href")
 
     rating, reviews = None, 0
-    block = await _text(page, "div.F7nice")  # e.g. "4.5\n(1,234)"
+    block = await _text(page, "div.F7nice")
     if block:
         rating = _to_float(block.split("\n")[0])
         m = re.search(r"\(([\d\s,.\u202f\u00a0]+)\)", block)
@@ -245,11 +241,9 @@ async def scrape_google_maps(
     stats: Optional[Dict] = None,
     wilaya: Optional[str] = None,
 ) -> List[Dict]:
-    """Return up to `max_leads` new, strictly-mobile leads inside the requested area.
+    # ضمان وجود Chromium مسبقاً قبل فتح المتصفح
+    _ensure_chromium_installed()
 
-    `stats` is filled in place (visited, skipped, non_mobile, failed, out_of_area)
-    so the UI can show live counters while the scraper runs.
-    """
     known = known or KnownLeads(enabled=False)
     stats = stats if stats is not None else {}
     stats.update(visited=0, skipped=0, non_mobile=0, failed=0, out_of_area=0)
@@ -258,8 +252,6 @@ async def scrape_google_maps(
     query = build_maps_query(keyword, city, resolved)
     search_url = f"https://www.google.com/maps/search/{quote_plus(query)}?hl=fr"
     results: List[Dict] = []
-    # Many listings have no phone or a landline, so look at more candidates than
-    # requested, then stop as soon as enough valid leads are collected.
     target = min(max(max_leads * 3, max_leads), 300)
 
     try:
@@ -288,13 +280,13 @@ async def scrape_google_maps(
                     try:
                         data = await _extract_place(page, url)
                     except (PWTimeout, PlaywrightError):
-                        stats["failed"] += 1  # skip this place, keep going
+                        stats["failed"] += 1
                     else:
                         e164, _ = normalize_algerian_phone(data.pop("phone_raw", ""))
                         if not _inside_wilaya(data.get("address", ""), city, resolved):
-                            stats["out_of_area"] += 1  # outside the requested wilaya
+                            stats["out_of_area"] += 1
                         elif not (e164 and MOBILE_E164_RE.fullmatch(e164)):
-                            stats["non_mobile"] += 1  # landline, invalid or missing number
+                            stats["non_mobile"] += 1
                         elif known.seen_lead(data["name"], city, e164):
                             stats["skipped"] += 1
                         else:
@@ -342,13 +334,10 @@ async def scrape_google_maps(
 
 
 def _new_loop() -> asyncio.AbstractEventLoop:
-    """On Windows, Streamlit/Tornado forces a Selector event loop which cannot
-    spawn subprocesses (needed by Playwright), so we create a Proactor loop."""
     return asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
 
 
 def run_scrape(*args, **kwargs) -> List[Dict]:
-    """Sync wrapper usable from Streamlit."""
     loop = _new_loop()
     try:
         return loop.run_until_complete(scrape_google_maps(*args, **kwargs))
@@ -359,8 +348,6 @@ def run_scrape(*args, **kwargs) -> List[Dict]:
 # --------------------------------------------------------------------------
 # Digital Health Audit: website reachability + a 0-100 health score
 # --------------------------------------------------------------------------
-# Social platforms don't count as a real web presence for the score: a Facebook
-# page alone is itself a weak spot ("No Real Website").
 SOCIAL_DOMAINS = (
     "facebook.com", "fb.com", "instagram.com", "tiktok.com", "linkedin.com",
     "youtube.com", "x.com", "twitter.com", "linktr.ee", "wa.me",
@@ -370,15 +357,14 @@ _UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-# Score weights (total 100)
-W_WEBSITE_OWN_ACTIVE = 30   # own domain that actually answers
-W_WEBSITE_OWN_DEAD = 10     # listed but unreachable: still better than nothing, but a weak spot
-W_RATING_GOOD = 20          # >= 4.2
-W_RATING_MID = 10           # 3.5 - 4.19
-W_REVIEWS_MANY = 20         # >= 25 reviews
-W_REVIEWS_SOME = 10         # 5 - 24
-W_WHATSAPP = 15             # reachable on WhatsApp (mobile line)
-W_CLAIMED = 15              # listing is not "thin" (heuristic below)
+W_WEBSITE_OWN_ACTIVE = 30
+W_WEBSITE_OWN_DEAD = 10
+W_RATING_GOOD = 20
+W_RATING_MID = 10
+W_REVIEWS_MANY = 20
+W_REVIEWS_SOME = 10
+W_WHATSAPP = 15
+W_CLAIMED = 15
 
 
 def compute_digital_health(
@@ -388,13 +374,6 @@ def compute_digital_health(
     reviews_count: int,
     has_whatsapp: bool,
 ) -> Dict:
-    """0-100 digital health score + the list of weak spots the AI pitch must target.
-
-    is_unclaimed is a heuristic: a Google profile with no website and no phone
-    is almost always an unclaimed / owner-less listing (real owners at least leave
-    a phone number or a link). Google does not expose the real claim flag to
-    scrapers, so we approximate it and flag it as a weak spot.
-    """
     website = (website or "").strip()
     site_active = site_active or "Unknown"
     rating = rating or 0.0
@@ -409,7 +388,6 @@ def compute_digital_health(
     is_social_only = bool(website) and any(host == d or host.endswith("." + d) for d in SOCIAL_DOMAINS)
 
     score, weak = 0, []
-    # Website block (30)
     if has_website and site_active == "Yes" and not is_social_only:
         score += W_WEBSITE_OWN_ACTIVE
     elif has_website and is_social_only:
@@ -420,7 +398,7 @@ def compute_digital_health(
         weak.append("Site web hors service")
     else:
         weak.append("Aucun site web")
-    # Rating block (20)
+
     if rating >= 4.2:
         score += W_RATING_GOOD
     elif rating >= 3.5:
@@ -431,7 +409,7 @@ def compute_digital_health(
         weak.append("Note Google très faible")
     else:
         weak.append("Aucune note Google")
-    # Reviews block (20)
+
     if reviews_count >= 25:
         score += W_REVIEWS_MANY
     elif reviews_count >= 5:
@@ -439,12 +417,12 @@ def compute_digital_health(
         weak.append("Peu d'avis Google")
     else:
         weak.append("Quasi aucun avis Google")
-    # WhatsApp block (15)
+
     if has_whatsapp:
         score += W_WHATSAPP
     else:
         weak.append("Pas de ligne WhatsApp")
-    # Claimed listing block (15)
+
     is_unclaimed = not website and not has_whatsapp
     if is_unclaimed:
         weak.append("Fiche Google probablement non réclamée")
@@ -461,7 +439,6 @@ def compute_digital_health(
 
 
 async def _check_website(client: httpx.AsyncClient, sem: asyncio.Semaphore, url: str) -> Dict:
-    """Reachability check of one URL. Returns site_active / site_type."""
     if not url or not str(url).strip():
         return {"site_active": "No website", "site_type": "None"}
     url = str(url).strip()
@@ -476,8 +453,7 @@ async def _check_website(client: httpx.AsyncClient, sem: asyncio.Semaphore, url:
     async with sem:
         for cand in candidates:
             try:
-                async with client.stream("GET", cand) as r:  # headers only, body is not downloaded
-                    # 401/403/429 = server answered (often a bot shield), so the site exists
+                async with client.stream("GET", cand) as r:
                     if r.status_code < 400 or r.status_code in (401, 403, 429):
                         active = True
                         break
@@ -487,11 +463,6 @@ async def _check_website(client: httpx.AsyncClient, sem: asyncio.Semaphore, url:
 
 
 async def audit_leads(leads: List[Dict], concurrency: int = 8, timeout: float = 8.0) -> List[Dict]:
-    """Run the Digital Health Audit over every lead. Result order matches input.
-
-    verify=False: we only test reachability (no data is sent), and many small
-    local sites have expired/misconfigured certificates but are still live.
-    """
     sem = asyncio.Semaphore(concurrency)
     async with httpx.AsyncClient(
         follow_redirects=True, timeout=timeout, verify=False, headers={"User-Agent": _UA}
@@ -513,7 +484,6 @@ async def audit_leads(leads: List[Dict], concurrency: int = 8, timeout: float = 
 
 
 def run_audit(leads: List[Dict]) -> List[Dict]:
-    """Sync wrapper usable from Streamlit."""
     loop = _new_loop()
     try:
         return loop.run_until_complete(audit_leads(leads))
